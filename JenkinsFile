@@ -1,0 +1,153 @@
+@Library('ecat-library@develop') _
+branchname = "develop"
+pipeline {
+	agent {
+		label 'azure21'
+	}
+	options {
+		skipDefaultCheckout true
+		disableConcurrentBuilds()
+		buildDiscarder(logRotator(numToKeepStr: '20'))
+	}
+	parameters {
+		string(name: 'oldfile', defaultValue: '', description: 'Please provide the filename of the running jar version')
+		string(name: 'newfile', defaultValue: '', description: 'Please provide the filename of the new jar version')
+		string(name: 'rollback', defaultValue: '', description: 'Please provide a BuildNo for ROLLBACK only, otherwise IGNORE this field')
+	}
+	stages {
+		stage('Checkout SCM') {
+			steps {
+				//deleteDir()
+				checkout scm
+			}
+		}
+		stage('Set Config Values') {
+			steps {
+				script {
+					configs = getjenkinvar.getAHUBJsonString(branchname)
+					BuildNo = "1.${BUILD_NUMBER}.0.0"
+					currentBuild.displayName = BuildNo
+					Target = getparams("target")
+					echo "Target is ${Target} && BuildNo is ${BuildNo}"
+					getjfval = configs."jfrog"
+					emailtoval = getjenkinvar.getemailval(getjfval.emailto)
+					gitops.checkout(branchname,DEPLOYMENTSCRIPTSREPO,"DeploymentScripts","Scripts")
+				}
+			}
+		}
+		stage('Code Build') {
+			when {
+				expression {
+					rollback.isEmpty()
+				}
+			}
+			steps {
+				script {
+					dir("${WORKSPACE}\\${params.componentname}\\") {
+						fileandfolderops.deletedirectory('build')
+						java.gradlebuildpublish()
+					}
+				}
+			}
+		}
+		stage('Download jars from JFrog') {
+			when {
+				expression {
+					!rollback.isEmpty()
+				}
+			}
+			steps {
+				script {
+					dir("${WORKSPACE}\\${params.componentname}\\") {
+						fileandfolderops.deletedirectory("${WORKSPACE}\\${params.componentname}\\build\\libs")
+						artifacts.download("${getjfval.artifactname}/${Target}/${params.componentname}/${rollback}/", "${WORKSPACE}\\${params.componentname}\\build\\libs\\", "true")
+					}
+				}
+			}
+		}
+		stage('Stop Services') {
+			steps {
+				script {
+					serversList = "${params.serverslist}"
+					servername = serversList.split(';')
+					servername.each {
+						getvalues = configs."${Target}"."${params.componentname}"."${it}"
+						serverName = getvalues.servername
+						echo "Checking in ${serverName}"
+						serviceList = getvalues.servicelist
+						echo "${serviceList} are going to be stop"
+						destinationpath = getvalues.destinations
+						echo "Deployment files path : ${destinationpath}"
+						dir("${WORKSPACE}\\${params.componentname}\\") {
+							powershell(returnStdout: true, script: "${WORKSPACE}\\Scripts\\DeploymentScripts\\AHUBuilder\\checkfiles.ps1 -oldfile ${oldfile} -serverName \\\\${serverName} -destinations ${destinationpath}")
+							powershell(returnStdout: true, script: "${WORKSPACE}\\Scripts\\DeploymentScripts\\AHUBuilder\\restartservice.ps1 -serverName \\\\${serverName} -serviceslist \"${serviceList}\" -activity stop")
+						}
+					}
+				}//script
+			}//steps
+		}//stage
+		stage('Replace new jars on Destination') {
+			steps {
+				script {
+					serversList = "${params.serverslist}"
+					servername = serversList.split(';')
+					servername.each {
+						getvalues = configs."${Target}"."${params.componentname}"."${it}"
+						serverName = getvalues.servername
+						echo "Checking in ${serverName}"
+						serviceList = getvalues.servicelist
+						echo "${serviceList} are going to be deploy"
+						destinationpath = getvalues.destinations
+						echo "Deployment files path : ${destinationpath}"
+						dir("${WORKSPACE}\\${params.componentname}\\") {
+							powershell(returnStdout: true, script: "${WORKSPACE}\\Scripts\\DeploymentScripts\\AHUBuilder\\deleteoldfiles.ps1 -sourcepath ${WORKSPACE}\\${params.componentname}\\build\\libs -oldfile ${oldfile} -serverName \\\\${serverName} -destinations ${destinationpath}")
+							powershell(returnStdout: true, script: "${WORKSPACE}\\Scripts\\DeploymentScripts\\AHUBuilder\\copynewfiles.ps1 -sourcepath ${WORKSPACE}\\${params.componentname}\\build\\libs -newfile ${newfile} -serverName \\\\${serverName} -destinations ${destinationpath}")
+						}
+					}
+				}//script
+			}//steps
+		}//stage
+		stage('Start Services') {
+			steps {
+				script {
+					serversList = "${params.serverslist}"
+					servername = serversList.split(';')
+					servername.each {
+						getvalues = configs."${Target}"."${params.componentname}"."${it}"
+						serverName = getvalues.servername
+						echo "Checking in ${serverName}"
+						serviceList = getvalues.servicelist
+						echo "${serviceList} are going to be start"
+						destinationpath = getvalues.destinations
+						echo "Deployment files path : ${destinationpath}"
+						dir("${WORKSPACE}\\${params.componentname}\\") {
+							powershell(returnStdout: true, script: "${WORKSPACE}\\Scripts\\DeploymentScripts\\AHUBuilder\\restartservice.ps1 -serverName \\\\${serverName} -serviceslist \"${serviceList}\" -activity start")
+						}
+					}
+				}//script
+			}//steps
+		}//stage
+		stage('Upload jars to JFrog') {
+			when {
+				expression {
+					rollback.isEmpty()
+				}
+			}
+			steps {
+				script {
+					dir("${WORKSPACE}\\${params.componentname}\\") {
+						artifacts.upload("${WORKSPACE}\\${params.componentname}\\build\\libs\\*.*", "${getjfval.artifactname}/${Target}/${params.componentname}/${BuildNo}/")
+					}
+				}
+			}
+		}//stage
+	}//stages
+	post {
+		always {
+			script {
+				emailext attachLog: true, body: '$DEFAULT_CONTENT', recipientProviders: [developers(), requestor()], replyTo: '$DEFAULT_REPLYTO', subject: '$DEFAULT_SUBJECT', to: "${emailtoval}"
+				bmtjenkins.bmtparams()
+			}
+		} //always
+	} //post
+}//pipeline

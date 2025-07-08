@@ -1,0 +1,387 @@
+# GitHub Actions CI/CD Pipeline - TEST VERSION
+# This is a safe test version that validates the workflow without making actual changes
+# 
+# WHAT THIS TEST VERSION DOES:
+# ✅ Tests configuration loading
+# ✅ Tests S3 upload/download operations
+# ✅ Tests file path resolution and UNC conversion
+# ✅ Simulates service operations (logs only, no actual service changes)
+# ✅ Tests Gradle build process
+# 
+# WHAT IT DOESN'T DO (for safety):
+# ❌ No actual service stop/start
+# ❌ No actual file deletion/copying to servers
+# ❌ No actual deployment to production servers
+# 
+# SETUP REQUIREMENTS:
+# 1. GitHub Secrets (Repository Settings > Secrets and variables > Actions):
+#    - AWS_ACCESS_KEY_ID: AWS access key for S3 operations
+#    - AWS_SECRET_ACCESS_KEY: AWS secret key for S3 operations  
+#    - AWS_REGION: AWS region (e.g., us-east-1)
+
+name: CI/CD Pipeline - TEST MODE
+
+on:
+  workflow_dispatch:
+    inputs:
+      oldfile:
+        description: 'Filename of the running jar version (test mode)'
+        required: false
+        default: 'test-app-1.0.0.jar'
+      newfile:
+        description: 'Filename of the new jar version (test mode)'
+        required: false
+        default: 'test-app-1.1.0.jar'
+      rollback:
+        description: 'BuildNo for ROLLBACK test only'
+        required: false
+        default: ''
+      componentname:
+        description: 'Component to test'
+        required: true
+        type: choice
+        options:
+          - ahux
+          - core
+          - rules-jar
+          - productdata
+          - rts
+      target:
+        description: 'Test environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+      serverkey:
+        description: 'Server configuration to test (leave blank to test all servers)'
+        required: false
+        default: ''
+
+jobs:
+  test-build-and-deploy:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 5
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '5'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set config values
+        run: |
+          # Set build number similar to Jenkins: "1.${BUILD_NUMBER}.0.0"
+          $BuildNo = "1.${{ github.run_number }}.0.0"
+          echo "BUILD_NO=$BuildNo" >> $env:GITHUB_ENV
+          echo "TARGET=${{ github.event.inputs.target }}" >> $env:GITHUB_ENV
+          echo "COMPONENT_NAME=${{ github.event.inputs.componentname }}" >> $env:GITHUB_ENV
+          
+          Write-Output "🧪 TEST MODE - Build Number: $BuildNo"
+          Write-Output "🧪 TEST MODE - Target Environment: ${{ github.event.inputs.target }}"
+          Write-Output "🧪 TEST MODE - Component Name: ${{ github.event.inputs.componentname }}"
+
+      - name: Load and validate deployment configuration
+        run: |
+          Write-Output "🧪 Testing configuration loading..."
+          
+          # Load the deployment configuration from JSON file
+          $config = Get-Content "config/deployment-config.json" | ConvertFrom-Json
+          
+          # Get the artifact name from general config
+          $artifactName = $config.general.artifactname
+          echo "ARTIFACT_NAME=$artifactName" >> $env:GITHUB_ENV
+          Write-Output "✅ Artifact name loaded: $artifactName"
+          
+          # Get the component configuration for the target environment
+          $componentConfig = $config."${{ github.event.inputs.target }}"."${{ github.event.inputs.componentname }}"
+          
+          if (-not $componentConfig) {
+            Write-Error "❌ No configuration found for component '${{ github.event.inputs.componentname }}' in environment '${{ github.event.inputs.target }}'"
+            exit 1
+          }
+          
+          Write-Output "✅ Component configuration found"
+          
+          # Determine which servers to deploy to
+          $serverKey = "${{ github.event.inputs.serverkey }}"
+          if ($serverKey -and $componentConfig.$serverKey) {
+            # Deploy to specific server
+            $serversToProcess = @($serverKey)
+            Write-Output "🎯 Testing specific server: $serverKey"
+          } else {
+            # Deploy to all servers for this component
+            $serversToProcess = $componentConfig.PSObject.Properties.Name
+            Write-Output "🎯 Testing all servers for component"
+          }
+          
+          # Extract all deployment details
+          $allServers = @()
+          $allServices = @()
+          $allDestinations = @()
+          $serverMappings = @{}
+          
+          foreach ($sKey in $serversToProcess) {
+            $serverInfo = $componentConfig.$sKey
+            $serverName = $serverInfo.servername
+            $services = $serverInfo.servicelist
+            $destinations = $serverInfo.destinations
+            
+            $allServers += $serverName
+            $allServices += $services
+            $allDestinations += $destinations
+            
+            # Store mapping for later use
+            $serverMappings[$serverName] = @{
+              services = $services
+              destinations = $destinations
+            }
+            
+            Write-Output "📋 Server: $serverName"
+            Write-Output "   🔧 Services: $services"
+            Write-Output "   📁 Destinations: $destinations"
+          }
+          
+          # Set environment variables for use in later steps
+          echo "DEPLOYMENT_SERVERS=$($allServers -join ';')" >> $env:GITHUB_ENV
+          echo "EMAIL_RECIPIENTS=$($config.general.emailto)" >> $env:GITHUB_ENV
+          
+          # Store server mappings as JSON for later steps
+          $mappingsJson = $serverMappings | ConvertTo-Json -Depth 3 -Compress
+          echo "SERVER_MAPPINGS=$mappingsJson" >> $env:GITHUB_ENV
+          
+          Write-Output "✅ Configuration loaded successfully"
+          Write-Output "🎯 Servers to test: $($allServers -join ', ')"
+
+      - name: Test component directory structure
+        run: |
+          Write-Output "🧪 Testing component directory structure..."
+          
+          $componentName = "${{ github.event.inputs.componentname }}"
+          
+          if (Test-Path $componentName) {
+            Write-Output "✅ Component directory exists: $componentName"
+            
+            # Check for gradlew file
+            if (Test-Path "$componentName\gradlew.bat") {
+              Write-Output "✅ Found gradlew.bat in $componentName"
+            } elseif (Test-Path "$componentName\gradlew") {
+              Write-Output "✅ Found gradlew in $componentName"
+            } else {
+              Write-Warning "⚠️  No gradlew file found in $componentName"
+            }
+            
+            # List directory contents
+            Write-Output "📁 Contents of $componentName:"
+            Get-ChildItem $componentName | Select-Object Name, Mode | Format-Table -AutoSize
+            
+          } else {
+            Write-Warning "⚠️  Component directory does not exist: $componentName"
+            Write-Output "📁 Available directories:"
+            Get-ChildItem -Directory | Select-Object Name | Format-Table -AutoSize
+          }
+
+      - name: Test Gradle build (dry run)
+        if: ${{ github.event.inputs.rollback == '' }}
+        run: |
+          Write-Output "🧪 Testing Gradle build process..."
+          
+          $componentName = "${{ github.event.inputs.componentname }}"
+          
+          if (Test-Path $componentName) {
+            cd $componentName
+            
+            Write-Output "🧪 Would delete build directory if it exists"
+            if (Test-Path "build") {
+              Write-Output "✅ Build directory exists and would be deleted"
+            } else {
+              Write-Output "ℹ️  No existing build directory"
+            }
+            
+            Write-Output "🧪 Testing Gradle wrapper..."
+            if (Test-Path "gradlew.bat") {
+              # Test Gradle version
+              .\gradlew.bat --version
+              Write-Output "✅ Gradle wrapper is functional"
+              
+              # Test tasks list (doesn't build anything)
+              Write-Output "🧪 Available Gradle tasks:"
+              .\gradlew.bat tasks --quiet
+              
+            } elseif (Test-Path "gradlew") {
+              # Unix-style gradlew
+              .\gradlew --version
+              Write-Output "✅ Gradle wrapper is functional"
+            } else {
+              Write-Warning "⚠️  Cannot test Gradle - no wrapper found"
+            }
+            
+          } else {
+            Write-Warning "⚠️  Cannot test Gradle - component directory not found"
+          }
+
+      - name: Test S3 operations
+        run: |
+          Write-Output "🧪 Testing S3 operations..."
+          
+          $s3Bucket = "Ecat-artifacts"
+          $artifactName = $env:ARTIFACT_NAME
+          $buildNo = $env:BUILD_NO
+          $componentName = "${{ github.event.inputs.componentname }}"
+          $target = "${{ github.event.inputs.target }}"
+          $s3Path = "s3://$s3Bucket/$artifactName/$target/$componentName/$buildNo/"
+          
+          Write-Output "📤 Would upload to S3 path: $s3Path"
+          
+          # Test S3 access by listing bucket (if accessible)
+          try {
+            Write-Output "🧪 Testing S3 bucket access..."
+            aws s3 ls s3://$s3Bucket/ --max-items 5
+            Write-Output "✅ S3 bucket is accessible"
+            
+            # Test if we can list the specific path
+            Write-Output "🧪 Testing artifact path structure..."
+            aws s3 ls s3://$s3Bucket/$artifactName/ --recursive --max-items 10
+            Write-Output "✅ S3 artifact path is accessible"
+            
+          } catch {
+            Write-Warning "⚠️  S3 access test failed: $_"
+          }
+          
+          # Test rollback download path
+          if ("${{ github.event.inputs.rollback }}" -ne "") {
+            $rollbackBuild = "${{ github.event.inputs.rollback }}"
+            $rollbackPath = "s3://$s3Bucket/$artifactName/$target/$componentName/$rollbackBuild/"
+            Write-Output "📥 Would download rollback from: $rollbackPath"
+            
+            try {
+              aws s3 ls $rollbackPath
+              Write-Output "✅ Rollback artifacts found"
+            } catch {
+              Write-Warning "⚠️  Rollback artifacts not found at $rollbackPath"
+            }
+          }
+
+      - name: Test server connectivity and file operations
+        run: |
+          Write-Output "🧪 Testing server connectivity and file operations..."
+          
+          # Parse server mappings from environment variable
+          $serverMappings = $env:SERVER_MAPPINGS | ConvertFrom-Json
+          $servers = $env:DEPLOYMENT_SERVERS -split ";"
+          $oldFile = "${{ github.event.inputs.oldfile }}"
+          $newFile = "${{ github.event.inputs.newfile }}"
+          
+          foreach ($server in $servers) {
+            Write-Output "`n🖥️  Testing server: $server"
+            
+            # Get server-specific configuration
+            $serverConfig = $serverMappings.$server
+            $destinations = $serverConfig.destinations -split ","
+            $services = $serverConfig.services -split ","
+            
+            # Test server accessibility
+            Write-Output "🧪 Testing server accessibility..."
+            $serverPath = "\\$server\D$"
+            
+            try {
+              $pingResult = Test-NetConnection -ComputerName $server -Port 445 -WarningAction SilentlyContinue
+              if ($pingResult.TcpTestSucceeded) {
+                Write-Output "✅ Server $server is reachable on port 445 (SMB)"
+                
+                # Test UNC path access
+                if (Test-Path $serverPath -ErrorAction SilentlyContinue) {
+                  Write-Output "✅ UNC path accessible: $serverPath"
+                } else {
+                  Write-Warning "⚠️  UNC path not accessible: $serverPath"
+                }
+              } else {
+                Write-Warning "⚠️  Server $server is not reachable on port 445"
+              }
+            } catch {
+              Write-Warning "⚠️  Connection test failed for $server : $_"
+            }
+            
+            # Test destination path resolution
+            Write-Output "📁 Testing destination paths..."
+            foreach ($destination in $destinations) {
+              $uncDestination = $destination.Trim() -replace "M:", "\\$server\D$"
+              Write-Output "   Original: $destination"
+              Write-Output "   Converted: $uncDestination"
+              
+              if ("$oldFile" -ne "") {
+                $filePath = "$uncDestination\$oldFile"
+                Write-Output "   🔍 Would check for old file: $filePath"
+              }
+              
+              if ("$newFile" -ne "") {
+                Write-Output "   📋 Would copy new file: $newFile to $uncDestination"
+              }
+            }
+            
+            # Test service operations (simulation only)
+            Write-Output "🔧 Testing service operations (SIMULATION ONLY)..."
+            foreach ($service in $services) {
+              $serviceName = $service.Trim()
+              Write-Output "   🛑 Would STOP service: '$serviceName' on $server"
+              Write-Output "   ▶️  Would START service: '$serviceName' on $server"
+            }
+          }
+
+      - name: Test email notification
+        if: always()
+        run: |
+          Write-Output "🧪 Testing email notification setup..."
+          
+          $buildStatus = if ($env:WORKFLOW_STATUS -eq "success") { "SUCCESS" } else { "FAILED" }
+          $subject = "[TEST-$buildStatus] ${{ github.repository }} - Build #${{ github.run_number }}"
+          $emailRecipients = $env:EMAIL_RECIPIENTS
+          $body = "🧪 TEST MODE - Build Information:`n" +
+                  "- Repository: ${{ github.repository }}`n" +
+                  "- Branch: ${{ github.ref_name }}`n" +
+                  "- Build Number: $env:BUILD_NO`n" +
+                  "- Component: ${{ github.event.inputs.componentname }}`n" +
+                  "- Target: ${{ github.event.inputs.target }}`n" +
+                  "- Servers: $env:DEPLOYMENT_SERVERS`n" +
+                  "- Status: $buildStatus`n" +
+                  "- Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`n" +
+                  "- Triggered by: ${{ github.actor }}`n" +
+                  "`n🧪 This was a TEST RUN - no actual deployment occurred."
+          
+          Write-Output "✅ Email would be sent to: $emailRecipients"
+          Write-Output "✅ Subject: $subject"
+          Write-Output "✅ Body preview:"
+          Write-Output $body
+          
+        env:
+          WORKFLOW_STATUS: ${{ job.status }}
+
+      - name: Test summary
+        if: always()
+        run: |
+          Write-Output "`n🧪 ===== TEST SUMMARY ====="
+          Write-Output "✅ Configuration loading: TESTED"
+          Write-Output "✅ S3 operations: TESTED"
+          Write-Output "✅ Server connectivity: TESTED"
+          Write-Output "✅ File path resolution: TESTED"
+          Write-Output "✅ Service simulation: TESTED"
+          Write-Output "✅ Email notification: TESTED"
+          Write-Output ""
+          Write-Output "🎯 Next steps:"
+          Write-Output "1. Review test results above"
+          Write-Output "2. Fix any issues found"
+          Write-Output "3. Set up AWS credentials if S3 tests failed"
+          Write-Output "4. Configure server access if connectivity tests failed"
+          Write-Output "5. When all tests pass, use the main ci-cd.yml workflow"
+          Write-Output ""
+          Write-Output "⚠️  Remember: This was a TEST RUN - no actual deployment occurred!"

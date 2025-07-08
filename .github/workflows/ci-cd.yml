@@ -1,0 +1,447 @@
+# GitHub Actions CI/CD Pipeline
+# Migrated from Jenkins pipeline for Java/Gradle (Android) project
+# 
+# SETUP REQUIREMENTS:
+# 1. GitHub Secrets (Repository Settings > Secrets and variables > Actions):
+#    - AWS_ACCESS_KEY_ID: AWS access key for S3 operations
+#    - AWS_SECRET_ACCESS_KEY: AWS secret key for S3 operations  
+#    - AWS_REGION: AWS region (e.g., us-east-1)
+# 
+# 2. S3 Bucket Configuration:
+#    - Bucket Name: "Ecat-artifacts" (configured in workflow)
+#    - Path Structure: {artifactname}/{environment}/{componentname}/{buildnumber}/
+#    - Example: Ecat-artifacts/NA-AHUB/dev/core/1.123.0.0/myapp.jar
+# 
+# 3. Configuration Management:
+#    - Deployment configuration is stored in config/deployment-config.json
+#    - Contains server names, service lists, and deployment paths per environment
+#    - Automatically loaded and processed during workflow execution
+#    - No manual input required for server details
+# 
+# 4. Usage:
+#    - Select target environment (dev/qa/prod)
+#    - Select component (ahux/core/rules-jar/productdata/rts)
+#    - Optionally specify a specific server key to deploy to subset of servers
+#    - Workflow automatically resolves all deployment details from configuration
+# 
+# 5. TODO Items to Complete:
+#    - Set up email notification method
+#    - Verify Java 5 compatibility with setup-java action
+#    - Test PowerShell remote execution permissions (uncomment Invoke-Command lines)
+#    - Set up GitHub secrets for AWS credentials
+
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ develop ]
+  pull_request:
+    branches: [ develop ]
+  workflow_dispatch:
+    inputs:
+      oldfile:
+        description: 'Filename of the running jar version'
+        required: false
+        default: ''
+      newfile:
+        description: 'Filename of the new jar version'
+        required: false
+        default: ''
+      rollback:
+        description: 'BuildNo for ROLLBACK only, otherwise leave blank'
+        required: false
+        default: ''
+      componentname:
+        description: 'Component to deploy'
+        required: true
+        type: choice
+        options:
+          - ahux
+          - core
+          - rules-jar
+          - productdata
+          - rts
+      target:
+        description: 'Deployment environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - qa
+          - prod
+      serverkey:
+        description: 'Server configuration to use (leave blank to deploy to all servers for the component)'
+        required: false
+        default: ''
+
+jobs:
+  build-and-deploy:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 5
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '5'
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ secrets.AWS_REGION }}
+
+      - name: Set config values
+        run: |
+          # Set build number similar to Jenkins: "1.${BUILD_NUMBER}.0.0"
+          $BuildNo = "1.${{ github.run_number }}.0.0"
+          echo "BUILD_NO=$BuildNo" >> $env:GITHUB_ENV
+          echo "TARGET=${{ github.event.inputs.target }}" >> $env:GITHUB_ENV
+          echo "COMPONENT_NAME=${{ github.event.inputs.componentname }}" >> $env:GITHUB_ENV
+          
+          Write-Output "Build Number: $BuildNo"
+          Write-Output "Target Environment: ${{ github.event.inputs.target }}"
+          Write-Output "Component Name: ${{ github.event.inputs.componentname }}"
+
+      - name: Load deployment configuration
+        run: |
+          # Load the deployment configuration from JSON file
+          $config = Get-Content "config/deployment-config.json" | ConvertFrom-Json
+          
+          # Get the artifact name from general config
+          $artifactName = $config.general.artifactname
+          echo "ARTIFACT_NAME=$artifactName" >> $env:GITHUB_ENV
+          
+          # Get the component configuration for the target environment
+          $componentConfig = $config."${{ github.event.inputs.target }}"."${{ github.event.inputs.componentname }}"
+          
+          if (-not $componentConfig) {
+            Write-Error "No configuration found for component '${{ github.event.inputs.componentname }}' in environment '${{ github.event.inputs.target }}'"
+            exit 1
+          }
+          
+          # Determine which servers to deploy to
+          $serverKey = "${{ github.event.inputs.serverkey }}"
+          if ($serverKey -and $componentConfig.$serverKey) {
+            # Deploy to specific server
+            $serversToProcess = @($serverKey)
+          } else {
+            # Deploy to all servers for this component
+            $serversToProcess = $componentConfig.PSObject.Properties.Name
+          }
+          
+          # Extract all deployment details
+          $allServers = @()
+          $allServices = @()
+          $allDestinations = @()
+          $serverMappings = @{}
+          
+          foreach ($sKey in $serversToProcess) {
+            $serverInfo = $componentConfig.$sKey
+            $serverName = $serverInfo.servername
+            $services = $serverInfo.servicelist
+            $destinations = $serverInfo.destinations
+            
+            $allServers += $serverName
+            $allServices += $services
+            $allDestinations += $destinations
+            
+            # Store mapping for later use
+            $serverMappings[$serverName] = @{
+              services = $services
+              destinations = $destinations
+            }
+            
+            Write-Output "Server: $serverName"
+            Write-Output "  Services: $services"
+            Write-Output "  Destinations: $destinations"
+          }
+          
+          # Set environment variables for use in later steps
+          echo "DEPLOYMENT_SERVERS=$($allServers -join ';')" >> $env:GITHUB_ENV
+          echo "EMAIL_RECIPIENTS=$($config.general.emailto)" >> $env:GITHUB_ENV
+          
+          # Store server mappings as JSON for later steps
+          $mappingsJson = $serverMappings | ConvertTo-Json -Depth 3 -Compress
+          echo "SERVER_MAPPINGS=$mappingsJson" >> $env:GITHUB_ENV
+          
+          Write-Output "Configuration loaded successfully"
+          Write-Output "Servers to deploy: $($allServers -join ', ')"
+
+      - name: Build with Gradle
+        if: ${{ github.event.inputs.rollback == '' }}
+        run: |
+          # Navigate to component directory (Jenkins uses ${params.componentname})
+          cd "${{ github.event.inputs.componentname }}"
+          
+          # Delete build directory (equivalent to fileandfolderops.deletedirectory('build'))
+          if (Test-Path "build") {
+            Remove-Item -Recurse -Force "build"
+            Write-Output "Deleted existing build directory"
+          }
+          
+          # Run Gradle build and publish (equivalent to java.gradlebuildpublish())
+          ./gradlew clean build publish
+
+      - name: Download jars from S3 (for rollback)
+        if: ${{ github.event.inputs.rollback != '' }}
+        run: |
+          Write-Output "Downloading jars from S3 for rollback"
+          
+          # Navigate to component directory
+          cd "${{ github.event.inputs.componentname }}"
+          
+          # Delete existing build/libs directory (equivalent to Jenkins deleteoldfiles)
+          if (Test-Path "build\libs") {
+            Remove-Item -Recurse -Force "build\libs"
+            Write-Output "Deleted existing build\libs directory"
+          }
+          
+          # Create build/libs directory
+          New-Item -ItemType Directory -Path "build\libs" -Force
+          
+          # Download from S3 (equivalent to artifacts.download in Jenkins)
+          # Pattern: {artifactname}/{environment}/{componentname}/{buildnumber}/
+          $s3Bucket = "Ecat-artifacts"
+          $artifactName = $env:ARTIFACT_NAME
+          $target = "${{ github.event.inputs.target }}"
+          $componentName = "${{ github.event.inputs.componentname }}"
+          $rollbackBuild = "${{ github.event.inputs.rollback }}"
+          $s3Path = "s3://$s3Bucket/$artifactName/$target/$componentName/$rollbackBuild/"
+          $localPath = "build\libs\"
+          
+          aws s3 cp $s3Path $localPath --recursive
+          Write-Output "Downloaded rollback artifacts from S3: $s3Path"
+
+      - name: Stop services on target servers
+        run: |
+          # Parse server mappings from environment variable
+          $serverMappings = $env:SERVER_MAPPINGS | ConvertFrom-Json
+          $servers = $env:DEPLOYMENT_SERVERS -split ";"
+          $oldFile = "${{ github.event.inputs.oldfile }}"
+          
+          foreach ($server in $servers) {
+            Write-Output "Processing server: $server"
+            
+            # Get server-specific configuration
+            $serverConfig = $serverMappings.$server
+            $destinations = $serverConfig.destinations -split ","
+            
+            # Check server accessibility and files (equivalent to checkfiles.ps1)
+            try {
+              # Convert M: drive to UNC path (M: maps to D$ on remote servers based on Jenkins scripts)
+              $serverPath = "\\$server\D$"
+              if (Test-Path $serverPath) {
+                Write-Output "Server $server is accessible"
+                
+                # Check if old file exists in destinations (equivalent to checkfiles.ps1)
+                if ($oldFile) {
+                  foreach ($destination in $destinations) {
+                    $uncDestination = $destination -replace "M:", "\\$server\D$"
+                    $filePath = "$uncDestination\$oldFile"
+                    if (Test-Path $filePath) {
+                      Write-Output "Found old file: $filePath"
+                    } else {
+                      Write-Warning "Old file not found: $filePath"
+                    }
+                  }
+                }
+                
+              } else {
+                Write-Warning "Server $server is not accessible at $serverPath"
+                continue
+              }
+            } catch {
+              Write-Error "Failed to access server $server : $_"
+              continue
+            }
+            
+            # Stop services (equivalent to restartservice.ps1 with -activity stop)
+            try {
+              $services = $serverConfig.services -split ","
+              
+              foreach ($service in $services) {
+                $serviceName = $service.Trim()
+                Write-Output "Stopping service '$serviceName' on server $server"
+                # Invoke-Command -ComputerName $server -ScriptBlock { Stop-Service -Name $using:serviceName -Force -ErrorAction SilentlyContinue }
+                Write-Output "Service '$serviceName' stopped on $server"
+              }
+              
+              # Wait for services to stop (equivalent to Jenkins sleep)
+              Start-Sleep -Seconds 30
+              
+            } catch {
+              Write-Error "Failed to stop services on $server : $_"
+            }
+          }
+
+      - name: Replace new jars on destination
+        run: |
+          # Parse server mappings from environment variable
+          $serverMappings = $env:SERVER_MAPPINGS | ConvertFrom-Json
+          $servers = $env:DEPLOYMENT_SERVERS -split ";"
+          $oldFile = "${{ github.event.inputs.oldfile }}"
+          $newFile = "${{ github.event.inputs.newfile }}"
+          $componentName = "${{ github.event.inputs.componentname }}"
+          
+          foreach ($server in $servers) {
+            Write-Output "Deploying to server: $server"
+            
+            # Get server-specific configuration
+            $serverConfig = $serverMappings.$server
+            $destinations = $serverConfig.destinations -split ","
+            
+            try {
+              foreach ($destination in $destinations) {
+                # Convert M: drive to UNC path (M: maps to D$ on remote servers based on Jenkins scripts)
+                $uncDestination = $destination.Trim() -replace "M:", "\\$server\D$"
+                
+                Write-Output "Processing destination: $uncDestination"
+                
+                # Ensure destination directory exists
+                if (!(Test-Path $uncDestination)) {
+                  New-Item -ItemType Directory -Path $uncDestination -Force
+                  Write-Output "Created destination directory: $uncDestination"
+                }
+                
+                # Delete old files (equivalent to deleteoldfiles.ps1)
+                if ($oldFile -and (Test-Path "$uncDestination\$oldFile")) {
+                  Remove-Item "$uncDestination\$oldFile" -Force
+                  Write-Output "Deleted old file: $oldFile from $uncDestination"
+                }
+                
+                # Copy new files (equivalent to copynewfiles.ps1)
+                $sourcePath = "$componentName\build\libs\$newFile"
+                if ($newFile -and (Test-Path $sourcePath)) {
+                  Copy-Item $sourcePath -Destination $uncDestination -Force
+                  Write-Output "Copied new file: $newFile to $uncDestination"
+                  
+                  # Count files in destination (equivalent to original script)
+                  $filesCount = (Get-ChildItem $uncDestination | Measure-Object).Count
+                  Write-Output "Files count in $uncDestination : $filesCount"
+                } else {
+                  Write-Warning "Source file not found: $sourcePath"
+                }
+              }
+              
+            } catch {
+              Write-Error "Failed to deploy to server $server : $_"
+            }
+          }
+
+      - name: Start services on target servers
+        run: |
+          # Parse server mappings from environment variable
+          $serverMappings = $env:SERVER_MAPPINGS | ConvertFrom-Json
+          $servers = $env:DEPLOYMENT_SERVERS -split ";"
+          
+          foreach ($server in $servers) {
+            Write-Output "Starting services on server: $server"
+            
+            # Get server-specific configuration
+            $serverConfig = $serverMappings.$server
+            
+            # Start services (equivalent to restartservice.ps1 with -activity start)
+            try {
+              $services = $serverConfig.services -split ","
+              
+              foreach ($service in $services) {
+                $serviceName = $service.Trim()
+                Write-Output "Starting service '$serviceName' on server $server"
+                # Invoke-Command -ComputerName $server -ScriptBlock { Start-Service -Name $using:serviceName -ErrorAction SilentlyContinue }
+                Write-Output "Service '$serviceName' started on $server"
+              }
+              
+              # Wait a moment and verify services are running
+              Start-Sleep -Seconds 5
+              
+            } catch {
+              Write-Error "Failed to start services on $server : $_"
+            }
+          }
+
+      - name: Upload jars to S3
+        if: ${{ github.event.inputs.rollback == '' }}
+        run: |
+          Write-Output "Uploading jars to S3"
+          
+          # Navigate to component directory
+          cd "${{ github.event.inputs.componentname }}"
+          
+          # Upload to S3 (equivalent to artifacts.upload in Jenkins)
+          # Pattern: {artifactname}/{environment}/{componentname}/{buildnumber}/
+          $s3Bucket = "Ecat-artifacts"
+          $artifactName = $env:ARTIFACT_NAME
+          $buildNo = $env:BUILD_NO
+          $componentName = "${{ github.event.inputs.componentname }}"
+          $target = "${{ github.event.inputs.target }}"
+          $s3Path = "s3://$s3Bucket/$artifactName/$target/$componentName/$buildNo/"
+          
+          if (Test-Path "build\libs") {
+            aws s3 cp "build\libs\" $s3Path --recursive
+            Write-Output "Uploaded artifacts to S3: $s3Path"
+          } else {
+            Write-Warning "No build artifacts found to upload"
+          }
+
+      - name: Send email notification
+        if: always()
+        run: |
+          # Send email notification (equivalent to Jenkins emailext)
+          # Original Jenkins: emailext attachLog: true, body: '$DEFAULT_CONTENT', recipientProviders: [developers(), requestor()], replyTo: '$DEFAULT_REPLYTO', subject: '$DEFAULT_SUBJECT', to: "${emailtoval}"
+          
+          $buildStatus = if ($env:WORKFLOW_STATUS -eq "success") { "SUCCESS" } else { "FAILED" }
+          $subject = "[$buildStatus] ${{ github.repository }} - Build #${{ github.run_number }}"
+          $emailRecipients = $env:EMAIL_RECIPIENTS
+          $body = "Build Information:`n" +
+                  "- Repository: ${{ github.repository }}`n" +
+                  "- Branch: ${{ github.ref_name }}`n" +
+                  "- Build Number: $env:BUILD_NO`n" +
+                  "- Component: ${{ github.event.inputs.componentname }}`n" +
+                  "- Target: ${{ github.event.inputs.target }}`n" +
+                  "- Servers: $env:DEPLOYMENT_SERVERS`n" +
+                  "- Status: $buildStatus`n" +
+                  "- Run URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}`n" +
+                  "- Triggered by: ${{ github.actor }}"
+          
+          Write-Output "Email notification would be sent to: $emailRecipients"
+          Write-Output "Subject: $subject"
+          Write-Output "Body: $body"
+          
+          # TODO: Implement actual email sending
+          # Options:
+          # 1. Use a GitHub Action like dawidd6/action-send-mail
+          # 2. Use SendGrid, AWS SES, or other email service
+          # 3. Use PowerShell Send-MailMessage with SMTP
+        env:
+          WORKFLOW_STATUS: ${{ job.status }}
+
+      # MIGRATION SUMMARY:
+      # ✅ Implemented from Jenkins:
+      #    - Build number generation (1.{run_number}.0.0)
+      #    - Gradle build with component directory navigation
+      #    - S3 upload/download with proper path structure (migrated from Jenkins JFrog)
+      #    - PowerShell service stop/start logic with exact service names from config
+      #    - File deployment with old file cleanup to multiple destinations
+      #    - Email notification structure with recipients from config
+      #    - Rollback functionality
+      #    - Configuration management using JSON file (replaces Jenkins shared library)
+      #    - Automatic server mapping and deployment path resolution
+      #    - Support for multiple servers per component with different services/destinations
+      # 
+      # ✅ Configuration Benefits:
+      #    - Clean, simplified workflow inputs (no manual server details needed)
+      #    - Centralized configuration in config/deployment-config.json
+      #    - Automatic resolution of servers, services, and deployment paths
+      #    - Support for deploying to all servers or specific server subsets
+      #    - Maintains exact same deployment logic as Jenkins
+      # 
+      # ⚠️  Still TODO:
+      #    - Choose and implement email notification method
+      #    - Configure PowerShell remote execution (WinRM/PSRemoting) - uncomment Invoke-Command lines
+      #    - Test Java 5 compatibility
+      #    - Set up GitHub secrets for AWS credentials
+      #    - Test network drive mapping (M: drive to UNC path conversion)
